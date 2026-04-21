@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -50,29 +51,41 @@ var (
 	}
 )
 
-type Snapshotter struct {
+// Snapshotter is the interface for saving and loading raft snapshots.
+// The disk-backed implementation is *Snapshotter; the in-memory implementation
+// is *InMemSnapshotter.
+type Snapshotter interface {
+	SaveSnap(snapshot raftpb.Snapshot) error
+	Load() (*raftpb.Snapshot, error)
+	LoadNewestAvailable(walSnaps []walpb.Snapshot) (*raftpb.Snapshot, error)
+	SaveDBFrom(r io.Reader, id uint64) (int64, error)
+	DBFilePath(id uint64) (string, error)
+	ReleaseSnapDBs(snap raftpb.Snapshot) error
+}
+
+type diskSnapshotter struct {
 	lg  *zap.Logger
 	dir string
 }
 
-func New(lg *zap.Logger, dir string) *Snapshotter {
+func New(lg *zap.Logger, dir string) *diskSnapshotter {
 	if lg == nil {
 		lg = zap.NewNop()
 	}
-	return &Snapshotter{
+	return &diskSnapshotter{
 		lg:  lg,
 		dir: dir,
 	}
 }
 
-func (s *Snapshotter) SaveSnap(snapshot raftpb.Snapshot) error {
+func (s *diskSnapshotter) SaveSnap(snapshot raftpb.Snapshot) error {
 	if raft.IsEmptySnap(snapshot) {
 		return nil
 	}
 	return s.save(&snapshot)
 }
 
-func (s *Snapshotter) save(snapshot *raftpb.Snapshot) error {
+func (s *diskSnapshotter) save(snapshot *raftpb.Snapshot) error {
 	start := time.Now()
 
 	fname := fmt.Sprintf("%016x-%016x%s", snapshot.Metadata.Term, snapshot.Metadata.Index, snapSuffix)
@@ -105,12 +118,12 @@ func (s *Snapshotter) save(snapshot *raftpb.Snapshot) error {
 }
 
 // Load returns the newest snapshot.
-func (s *Snapshotter) Load() (*raftpb.Snapshot, error) {
+func (s *diskSnapshotter) Load() (*raftpb.Snapshot, error) {
 	return s.loadMatching(func(*raftpb.Snapshot) bool { return true })
 }
 
 // LoadNewestAvailable loads the newest snapshot available that is in walSnaps.
-func (s *Snapshotter) LoadNewestAvailable(walSnaps []walpb.Snapshot) (*raftpb.Snapshot, error) {
+func (s *diskSnapshotter) LoadNewestAvailable(walSnaps []walpb.Snapshot) (*raftpb.Snapshot, error) {
 	return s.loadMatching(func(snapshot *raftpb.Snapshot) bool {
 		m := snapshot.Metadata
 		for i := len(walSnaps) - 1; i >= 0; i-- {
@@ -123,7 +136,7 @@ func (s *Snapshotter) LoadNewestAvailable(walSnaps []walpb.Snapshot) (*raftpb.Sn
 }
 
 // loadMatching returns the newest snapshot where matchFn returns true.
-func (s *Snapshotter) loadMatching(matchFn func(*raftpb.Snapshot) bool) (*raftpb.Snapshot, error) {
+func (s *diskSnapshotter) loadMatching(matchFn func(*raftpb.Snapshot) bool) (*raftpb.Snapshot, error) {
 	names, err := s.snapNames()
 	if err != nil {
 		return nil, err
@@ -137,7 +150,7 @@ func (s *Snapshotter) loadMatching(matchFn func(*raftpb.Snapshot) bool) (*raftpb
 	return nil, ErrNoSnapshot
 }
 
-func (s *Snapshotter) loadSnap(name string) (*raftpb.Snapshot, error) {
+func (s *diskSnapshotter) loadSnap(name string) (*raftpb.Snapshot, error) {
 	fpath := filepath.Join(s.dir, name)
 	snap, err := Read(s.lg, fpath)
 	if err != nil {
@@ -197,7 +210,7 @@ func Read(lg *zap.Logger, snapname string) (*raftpb.Snapshot, error) {
 
 // snapNames returns the filename of the snapshots in logical time order (from newest to oldest).
 // If there is no available snapshots, an ErrNoSnapshot will be returned.
-func (s *Snapshotter) snapNames() ([]string, error) {
+func (s *diskSnapshotter) snapNames() ([]string, error) {
 	dir, err := os.Open(s.dir)
 	if err != nil {
 		return nil, err
@@ -219,7 +232,7 @@ func (s *Snapshotter) snapNames() ([]string, error) {
 	return snaps, nil
 }
 
-func (s *Snapshotter) checkSuffix(names []string) []string {
+func (s *diskSnapshotter) checkSuffix(names []string) []string {
 	var snaps []string
 	for i := range names {
 		if strings.HasSuffix(names[i], snapSuffix) {
@@ -237,7 +250,7 @@ func (s *Snapshotter) checkSuffix(names []string) []string {
 
 // cleanupSnapdir removes any files that should not be in the snapshot directory:
 // - db.tmp prefixed files that can be orphaned by defragmentation
-func (s *Snapshotter) cleanupSnapdir(filenames []string) (names []string, err error) {
+func (s *diskSnapshotter) cleanupSnapdir(filenames []string) (names []string, err error) {
 	names = make([]string, 0, len(filenames))
 	for _, filename := range filenames {
 		if strings.HasPrefix(filename, "db.tmp") {
@@ -252,7 +265,7 @@ func (s *Snapshotter) cleanupSnapdir(filenames []string) (names []string, err er
 	return names, nil
 }
 
-func (s *Snapshotter) ReleaseSnapDBs(snap raftpb.Snapshot) error {
+func (s *diskSnapshotter) ReleaseSnapDBs(snap raftpb.Snapshot) error {
 	dir, err := os.Open(s.dir)
 	if err != nil {
 		return err

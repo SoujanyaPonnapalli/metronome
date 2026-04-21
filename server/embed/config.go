@@ -434,6 +434,19 @@ type Config struct {
 	// Setting this is unsafe and will cause data loss.
 	UnsafeNoFsync bool `json:"unsafe-no-fsync"`
 
+	// ExperimentalInMemOnly disables all WAL and snapshot disk I/O.
+	// The raft log and snapshots are kept entirely in memory.
+	// The node is ephemeral: all state is lost on restart.
+	ExperimentalInMemOnly bool `json:"experimental-in-mem-only"`
+
+	// Metronome enables the metronome persist-set scheme: each log entry
+	// and snapshot is persisted only by a rotating K-sized subset of nodes.
+	// HardState is always persisted. Mutually exclusive with
+	// ExperimentalInMemOnly.
+	Metronome bool `json:"metronome"`
+	// MetronomeQuorumSize is the persist-set size K; 0 selects default f+1.
+	MetronomeQuorumSize uint `json:"metronome-quorum-size"`
+
 	// DowngradeCheckTime is the duration between two downgrade status checks (in seconds).
 	DowngradeCheckTime time.Duration `json:"downgrade-check-time"`
 
@@ -759,6 +772,9 @@ func (cfg *Config) AddFlags(fs *flag.FlagSet) {
 	// unsafe
 	fs.BoolVar(&cfg.UnsafeNoFsync, "unsafe-no-fsync", false, "Disables fsync, unsafe, will cause data loss.")
 	fs.BoolVar(&cfg.ForceNewCluster, "force-new-cluster", false, "Force to create a new one member cluster.")
+	fs.BoolVar(&cfg.ExperimentalInMemOnly, "experimental-in-mem-only", false, "Disables all WAL and snapshot disk I/O. All raft log and snapshot state is kept in memory only. The node is ephemeral: state is lost on restart.")
+	fs.BoolVar(&cfg.Metronome, "metronome", false, "Enables the metronome persist-set scheme: each entry/snapshot is persisted only by a rotating K-sized subset of the cluster. Mutually exclusive with --experimental-in-mem-only.")
+	fs.UintVar(&cfg.MetronomeQuorumSize, "metronome-quorum-size", 0, "Size of the persist-set K (range [f+1, N]). 0 selects f+1.")
 
 	// featuregate
 	cfg.ServerFeatureGate.(featuregate.MutableFeatureGate).AddFlag(fs, ServerFeatureGateFlagName)
@@ -935,6 +951,12 @@ func updateMinMaxVersions(info *transport.TLSInfo, min, max string) {
 func (cfg *Config) Validate() error {
 	if err := cfg.setupLogging(); err != nil {
 		return err
+	}
+	if cfg.Metronome && cfg.ExperimentalInMemOnly {
+		return fmt.Errorf("--metronome and --experimental-in-mem-only are mutually exclusive")
+	}
+	if !cfg.Metronome && cfg.MetronomeQuorumSize != 0 {
+		return fmt.Errorf("--metronome-quorum-size requires --metronome")
 	}
 	if err := checkBindURLs(cfg.ListenPeerUrls); err != nil {
 		return err

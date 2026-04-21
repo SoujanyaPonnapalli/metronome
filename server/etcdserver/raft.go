@@ -26,6 +26,7 @@ import (
 	"go.etcd.io/etcd/client/pkg/v3/logutil"
 	"go.etcd.io/etcd/pkg/v3/contention"
 	"go.etcd.io/etcd/server/v3/etcdserver/api/rafthttp"
+	"go.etcd.io/etcd/server/v3/etcdserver/metronome"
 	serverstorage "go.etcd.io/etcd/server/v3/storage"
 	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
@@ -117,6 +118,15 @@ type raftNodeConfig struct {
 	// clients should timeout and reissue their messages.
 	// If transport is nil, server will panic.
 	transport rafthttp.Transporter
+
+	// localID is this node's raft ID. Used by the metronome scheme to
+	// decide whether this node is in the persist-set for a given entry.
+	// Zero when metronomeScheme is nil.
+	localID uint64
+	// metronomeScheme, if non-nil, filters which entries and snapshots
+	// this node WAL-persists. HardState is always persisted regardless
+	// of the scheme. The leader always persists everything.
+	metronomeScheme *metronome.Scheme
 }
 
 func newRaftNode(cfg raftNodeConfig) *raftNode {
@@ -243,15 +253,25 @@ func (r *raftNode) start(rh *raftReadyHandler) {
 				// Must save the snapshot file and WAL snapshot entry before saving any other entries or hardstate to
 				// ensure that recovery after a snapshot restore is possible.
 				if !raft.IsEmptySnap(rd.Snapshot) {
-					// gofail: var raftBeforeSaveSnap struct{}
-					if err := r.storage.SaveSnap(rd.Snapshot); err != nil {
-						r.lg.Fatal("failed to save Raft snapshot", zap.Error(err))
+					if r.shouldPersistSnapshot(islead, rd.Snapshot.Metadata.Index) {
+						// gofail: var raftBeforeSaveSnap struct{}
+						if err := r.storage.SaveSnap(rd.Snapshot); err != nil {
+							r.lg.Fatal("failed to save Raft snapshot", zap.Error(err))
+						}
+						// gofail: var raftAfterSaveSnap struct{}
 					}
-					// gofail: var raftAfterSaveSnap struct{}
 				}
 
+				// Under metronome, filter entries so only nodes in the
+				// persist-set for each entry index WAL-write it. The
+				// leader always persists everything for simpler recovery.
+				// HardState is always passed through unchanged.
+				entsToSave := rd.Entries
+				if r.metronomeScheme != nil && !islead {
+					entsToSave = r.filterMetronomeEntries(rd.Entries)
+				}
 				// gofail: var raftBeforeSave struct{}
-				if err := r.storage.Save(rd.HardState, rd.Entries); err != nil {
+				if err := r.storage.Save(rd.HardState, entsToSave); err != nil {
 					r.lg.Fatal("failed to save Raft hard state and entries", zap.Error(err))
 				}
 				if !raft.IsEmptyHardState(rd.HardState) {
@@ -396,6 +416,38 @@ func (r *raftNode) processMessages(ms []raftpb.Message) []raftpb.Message {
 		}
 	}
 	return ms
+}
+
+// shouldPersistSnapshot decides whether this node should WAL-persist
+// the raft snapshot at the given index. Leaders always persist. Under
+// metronome, followers persist only if they are in the snapshot's
+// persist-set; when the scheme is disabled, all nodes persist.
+func (r *raftNode) shouldPersistSnapshot(islead bool, snapshotIndex uint64) bool {
+	if r.metronomeScheme == nil || islead {
+		return true
+	}
+	return r.metronomeScheme.ShouldPersist(r.localID, snapshotIndex)
+}
+
+// filterMetronomeEntries returns the subset of entries that this
+// follower should WAL-persist under the active metronome scheme.
+// Configuration-change entries (EntryConfChange, EntryConfChangeV2) are
+// always kept: membership transitions must be durable on every node so
+// the scheme can be reconstructed post-restart.
+func (r *raftNode) filterMetronomeEntries(ents []raftpb.Entry) []raftpb.Entry {
+	if len(ents) == 0 {
+		return ents
+	}
+	out := ents[:0:0] // don't mutate caller's slice
+	for i := range ents {
+		e := &ents[i]
+		keep := e.Type == raftpb.EntryConfChange || e.Type == raftpb.EntryConfChangeV2 ||
+			r.metronomeScheme.ShouldPersist(r.localID, e.Index)
+		if keep {
+			out = append(out, *e)
+		}
+	}
+	return out
 }
 
 func (r *raftNode) apply() chan toApply {

@@ -176,6 +176,21 @@ type ServerConfig struct {
 	// Setting this is unsafe and will cause data loss.
 	UnsafeNoFsync bool `json:"unsafe-no-fsync"`
 
+	// ExperimentalInMemOnly disables all WAL and snapshot disk I/O.
+	// The raft log and snapshots are kept entirely in memory.
+	// The node is ephemeral: all state is lost on restart.
+	ExperimentalInMemOnly bool `json:"experimental-in-mem-only"`
+
+	// Metronome enables a rotating persist-set for raft log entries and
+	// snapshots. Only a quorum-sized subset of nodes WAL-persists each
+	// entry; the rest keep it only in memory. HardState (term/vote/commit)
+	// is always persisted on every node. Mutually exclusive with
+	// ExperimentalInMemOnly.
+	Metronome bool `json:"metronome"`
+	// MetronomeQuorumSize is the size K of the persist-set per entry.
+	// Valid range is [f+1, N]. 0 means default (f+1).
+	MetronomeQuorumSize uint `json:"metronome-quorum-size"`
+
 	DowngradeCheckTime time.Duration
 
 	// MemoryMlock enables mlocking of etcd owned memory pages.

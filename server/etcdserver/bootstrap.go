@@ -39,6 +39,7 @@ import (
 	"go.etcd.io/etcd/server/v3/etcdserver/api/snap"
 	"go.etcd.io/etcd/server/v3/etcdserver/api/v3discovery"
 	"go.etcd.io/etcd/server/v3/etcdserver/cindex"
+	"go.etcd.io/etcd/server/v3/etcdserver/metronome"
 	servererrors "go.etcd.io/etcd/server/v3/etcdserver/errors"
 	serverstorage "go.etcd.io/etcd/server/v3/storage"
 	"go.etcd.io/etcd/server/v3/storage/backend"
@@ -50,6 +51,10 @@ import (
 )
 
 func bootstrap(cfg config.ServerConfig) (b *bootstrappedServer, err error) {
+	if cfg.ExperimentalInMemOnly {
+		return bootstrapInMem(cfg)
+	}
+
 	if cfg.MaxRequestBytes > recommendedMaxRequestBytes {
 		cfg.Logger.Warn(
 			"exceeded recommended request limit",
@@ -152,7 +157,7 @@ type bootstrappedServer struct {
 	cluster *bootstrappedCluster
 	raft    *bootstrappedRaft
 	prt     http.RoundTripper
-	ss      *snap.Snapshotter
+	ss      snap.Snapshotter
 }
 
 func (s *bootstrappedServer) Close() {
@@ -206,7 +211,7 @@ func bootstrapStorage(cfg config.ServerConfig, be *bootstrappedBackend, wal *boo
 	}
 }
 
-func bootstrapSnapshot(cfg config.ServerConfig) *snap.Snapshotter {
+func bootstrapSnapshot(cfg config.ServerConfig) snap.Snapshotter {
 	if err := fileutil.TouchDirAll(cfg.Logger, cfg.SnapDir()); err != nil {
 		cfg.Logger.Fatal(
 			"failed to create snapshot directory",
@@ -225,6 +230,68 @@ func bootstrapSnapshot(cfg config.ServerConfig) *snap.Snapshotter {
 		)
 	}
 	return snap.New(cfg.Logger, cfg.SnapDir())
+}
+
+// bootstrapInMem creates a server that keeps all raft log and snapshot state
+// in memory only. No WAL files or snapshot files are created. The node is
+// ephemeral: all raft state is lost on restart.
+func bootstrapInMem(cfg config.ServerConfig) (*bootstrappedServer, error) {
+	// Backend still uses disk (BoltDB) — only WAL and raft snapshots are in-mem.
+	// Ensure data and member directories exist for the backend.
+	if terr := fileutil.TouchDirAll(cfg.Logger, cfg.DataDir); terr != nil {
+		return nil, fmt.Errorf("cannot access data directory: %w", terr)
+	}
+	if terr := fileutil.TouchDirAll(cfg.Logger, cfg.MemberDir()); terr != nil {
+		return nil, fmt.Errorf("cannot access member directory: %w", terr)
+	}
+	if terr := fileutil.TouchDirAll(cfg.Logger, cfg.SnapDir()); terr != nil {
+		return nil, fmt.Errorf("cannot access snap directory: %w", terr)
+	}
+
+	prt, err := rafthttp.NewRoundTripper(cfg.PeerTLSInfo, cfg.PeerDialTimeout())
+	if err != nil {
+		return nil, err
+	}
+
+	ss := snap.NewInMem(cfg.Logger)
+
+	// Backend still uses disk (BoltDB). Only WAL and snapshots are in-mem.
+	be, err := bootstrapBackend(cfg, false /* haveWAL */)
+	if err != nil {
+		return nil, err
+	}
+
+	cluster, err := bootstrapNewClusterNoWAL(cfg, prt)
+	if err != nil {
+		be.Close()
+		return nil, err
+	}
+
+	// Empty bootstrappedWAL — no entries, no hard state, no snapshot.
+	// MemoryStorage starts fresh.
+	bwal := &bootstrappedWAL{
+		lg: cfg.Logger,
+	}
+
+	s := &bootstrappedStorage{
+		backend: be,
+		wal:     bwal,
+	}
+
+	if err = cluster.Finalize(cfg, s); err != nil {
+		be.Close()
+		return nil, err
+	}
+
+	raftNode := bootstrapRaftFromCluster(cfg, cluster.cl, cluster.cl.MemberIDs(), bwal)
+
+	return &bootstrappedServer{
+		prt:     prt,
+		ss:      ss,
+		storage: s,
+		cluster: cluster,
+		raft:    raftNode,
+	}, nil
 }
 
 func bootstrapBackend(cfg config.ServerConfig, haveWAL bool) (backend *bootstrappedBackend, err error) {
@@ -550,7 +617,7 @@ func raftConfig(cfg config.ServerConfig, id uint64, s *raft.MemoryStorage) *raft
 	}
 }
 
-func (b *bootstrappedRaft) newRaftNode(ss *snap.Snapshotter, wal *wal.WAL, cl *membership.RaftCluster) *raftNode {
+func (b *bootstrappedRaft) newRaftNode(cfg config.ServerConfig, ss snap.Snapshotter, wal *wal.WAL, cl *membership.RaftCluster) *raftNode {
 	var n raft.Node
 	if len(b.peers) == 0 {
 		n = raft.RestartNode(b.config)
@@ -560,16 +627,51 @@ func (b *bootstrappedRaft) newRaftNode(ss *snap.Snapshotter, wal *wal.WAL, cl *m
 	raftStatusMu.Lock()
 	raftStatus = n.Status
 	raftStatusMu.Unlock()
+
+	// Build the metronome scheme if enabled. Disabled for N=1 (single-node
+	// clusters don't benefit and the round-robin collapses to "always persist").
+	var scheme *metronome.Scheme
+	localID := b.config.ID
+	if cfg.Metronome && cl != nil && len(cl.MemberIDs()) > 1 {
+		members := cl.MemberIDs()
+		ids := make([]uint64, 0, len(members))
+		for _, m := range members {
+			ids = append(ids, uint64(m))
+		}
+		k := int(cfg.MetronomeQuorumSize) // 0 → default (f+1) inside NewScheme
+		s, err := metronome.NewScheme(ids, k)
+		if err != nil {
+			b.lg.Fatal("failed to construct metronome scheme", zap.Error(err))
+		}
+		scheme = s
+		b.lg.Info("metronome enabled",
+			zap.Int("cluster-size", s.NumNodes()),
+			zap.Int("quorum-size", s.QuorumSize()),
+			zap.Uint64("local-id", localID),
+		)
+	}
+
 	return newRaftNode(
 		raftNodeConfig{
-			lg:          b.lg,
-			isIDRemoved: func(id uint64) bool { return cl.IsIDRemoved(types.ID(id)) },
-			Node:        n,
-			heartbeat:   b.heartbeat,
-			raftStorage: b.storage,
-			storage:     serverstorage.NewStorage(b.lg, wal, ss),
+			lg:              b.lg,
+			isIDRemoved:     func(id uint64) bool { return cl.IsIDRemoved(types.ID(id)) },
+			Node:            n,
+			heartbeat:       b.heartbeat,
+			raftStorage:     b.storage,
+			storage:         buildRaftStorage(b.lg, wal, ss),
+			localID:         localID,
+			metronomeScheme: scheme,
 		},
 	)
+}
+
+// buildRaftStorage returns an InMemStorage when wal is nil (ExperimentalInMemOnly
+// mode), otherwise wraps the WAL and snapshotter in the disk-backed storage.
+func buildRaftStorage(lg *zap.Logger, w *wal.WAL, ss snap.Snapshotter) serverstorage.Storage {
+	if w == nil {
+		return serverstorage.NewInMemStorage()
+	}
+	return serverstorage.NewStorage(lg, w, ss)
 }
 
 func bootstrapWALFromSnapshot(cfg config.ServerConfig, snapshot *raftpb.Snapshot, ci cindex.ConsistentIndexer) *bootstrappedWAL {

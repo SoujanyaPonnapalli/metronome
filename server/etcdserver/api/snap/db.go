@@ -32,7 +32,7 @@ var ErrNoDBSnapshot = errors.New("snap: snapshot file doesn't exist")
 
 // SaveDBFrom saves snapshot of the database from the given reader. It
 // guarantees the save operation is atomic.
-func (s *Snapshotter) SaveDBFrom(r io.Reader, id uint64) (int64, error) {
+func (s *diskSnapshotter) SaveDBFrom(r io.Reader, id uint64) (int64, error) {
 	start := time.Now()
 
 	f, err := os.CreateTemp(s.dir, "tmp")
@@ -75,7 +75,7 @@ func (s *Snapshotter) SaveDBFrom(r io.Reader, id uint64) (int64, error) {
 
 // DBFilePath returns the file path for the snapshot of the database with
 // given id. If the snapshot does not exist, it returns error.
-func (s *Snapshotter) DBFilePath(id uint64) (string, error) {
+func (s *diskSnapshotter) DBFilePath(id uint64) (string, error) {
 	if _, err := fileutil.ReadDir(s.dir); err != nil {
 		return "", err
 	}
@@ -94,6 +94,6 @@ func (s *Snapshotter) DBFilePath(id uint64) (string, error) {
 	return "", ErrNoDBSnapshot
 }
 
-func (s *Snapshotter) dbFilePath(id uint64) string {
+func (s *diskSnapshotter) dbFilePath(id uint64) string {
 	return filepath.Join(s.dir, fmt.Sprintf("%016x.snap.db", id))
 }

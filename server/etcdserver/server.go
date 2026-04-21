@@ -240,7 +240,7 @@ type EtcdServer struct {
 
 	cluster *membership.RaftCluster
 
-	snapshotter *snap.Snapshotter
+	snapshotter snap.Snapshotter
 
 	uberApply apply.UberApplier
 
@@ -316,7 +316,7 @@ func NewServer(cfg config.ServerConfig) (srv *EtcdServer, err error) {
 		lg:                    cfg.Logger,
 		errorc:                make(chan error, 1),
 		snapshotter:           b.ss,
-		r:                     *b.raft.newRaftNode(b.ss, b.storage.wal.w, b.cluster.cl),
+		r:                     *b.raft.newRaftNode(cfg, b.ss, b.storage.wal.w, b.cluster.cl),
 		memberID:              b.cluster.nodeID,
 		attributes:            membership.Attributes{Name: cfg.Name, ClientURLs: cfg.ClientURLs.StringSlice()},
 		cluster:               b.cluster.cl,
@@ -595,6 +595,11 @@ func (s *EtcdServer) start() {
 
 func (s *EtcdServer) purgeFile() {
 	lg := s.Logger()
+	if s.Cfg.ExperimentalInMemOnly {
+		// No WAL or snap files on disk to purge.
+		<-s.stopping
+		return
+	}
 	var dberrc, serrc, werrc <-chan error
 	var dbdonec, sdonec, wdonec <-chan struct{}
 	if s.Cfg.MaxSnapFiles > 0 {

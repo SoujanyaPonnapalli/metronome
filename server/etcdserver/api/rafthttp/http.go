@@ -165,13 +165,13 @@ type snapshotHandler struct {
 	lg          *zap.Logger
 	tr          Transporter
 	r           Raft
-	snapshotter *snap.Snapshotter
+	snapshotter snap.Snapshotter
 
 	localID types.ID
 	cid     types.ID
 }
 
-func newSnapshotHandler(t *Transport, r Raft, snapshotter *snap.Snapshotter, cid types.ID) http.Handler {
+func newSnapshotHandler(t *Transport, r Raft, snapshotter snap.Snapshotter, cid types.ID) http.Handler {
 	h := &snapshotHandler{
 		lg:          t.Logger,
 		tr:          t,

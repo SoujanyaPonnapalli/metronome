@@ -45,14 +45,14 @@ type Storage interface {
 
 type storage struct {
 	lg *zap.Logger
-	s  *snap.Snapshotter
+	s  snap.Snapshotter
 
 	// Mutex protected variables
 	mux sync.RWMutex
 	w   *wal.WAL
 }
 
-func NewStorage(lg *zap.Logger, w *wal.WAL, s *snap.Snapshotter) Storage {
+func NewStorage(lg *zap.Logger, w *wal.WAL, s snap.Snapshotter) Storage {
 	return &storage{lg: lg, w: w, s: s}
 }
 

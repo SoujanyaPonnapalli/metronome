@@ -66,8 +66,8 @@ type raftNode struct {
 	raftStorage *raft.MemoryStorage
 	wal         *wal.WAL
 
-	snapshotter      *snap.Snapshotter
-	snapshotterReady chan *snap.Snapshotter // signals when snapshotter is ready
+	snapshotter      snap.Snapshotter
+	snapshotterReady chan snap.Snapshotter // signals when snapshotter is ready
 
 	snapCount uint64
 	transport *rafthttp.Transport
@@ -87,7 +87,7 @@ var defaultSnapshotCount uint64 = 10000
 // current), then new log entries. To shutdown, close proposeC and read errorC.
 func newRaftNode(id int, peers []string, join bool, getSnapshot func() ([]byte, error), proposeC <-chan string,
 	confChangeC <-chan raftpb.ConfChange,
-) (<-chan *commit, <-chan error, <-chan *snap.Snapshotter) {
+) (<-chan *commit, <-chan error, <-chan snap.Snapshotter) {
 	commitC := make(chan *commit)
 	errorC := make(chan error)
 
@@ -109,7 +109,7 @@ func newRaftNode(id int, peers []string, join bool, getSnapshot func() ([]byte, 
 
 		logger: zap.NewExample(),
 
-		snapshotterReady: make(chan *snap.Snapshotter, 1),
+		snapshotterReady: make(chan snap.Snapshotter, 1),
 		// rest of structure populated after WAL replay
 	}
 	go rc.startRaft()
