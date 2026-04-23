@@ -32,7 +32,7 @@ type kvstore struct {
 	proposeC    chan<- string // channel for proposing updates
 	mu          sync.RWMutex
 	kvStore     map[string]string // current committed key-value pairs
-	snapshotter *snap.Snapshotter
+	snapshotter snap.Snapshotter
 }
 
 type kv struct {
@@ -40,7 +40,7 @@ type kv struct {
 	Val string
 }
 
-func newKVStore(snapshotter *snap.Snapshotter, proposeC chan<- string, commitC <-chan *commit, errorC <-chan error) *kvstore {
+func newKVStore(snapshotter snap.Snapshotter, proposeC chan<- string, commitC <-chan *commit, errorC <-chan error) *kvstore {
 	s := &kvstore{proposeC: proposeC, kvStore: make(map[string]string), snapshotter: snapshotter}
 	snapshot, err := s.loadSnapshot()
 	if err != nil {

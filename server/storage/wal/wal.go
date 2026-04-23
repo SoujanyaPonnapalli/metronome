@@ -22,6 +22,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -448,6 +449,125 @@ func openWALFiles(lg *zap.Logger, dirpath string, names []string, nameIndex int,
 	closer := func() error { return closeAll(lg, rcs...) }
 
 	return rs, ls, closer, nil
+}
+
+// ReadAllSparse is like ReadAll but tolerates non-contiguous entry
+// indices in the on-disk log. It is used by the metronome scheme where
+// each node persists only a rotating subset of entries. The returned
+// `ents` slice contains the entries present on disk in index order;
+// callers are responsible for filling any gaps (e.g., by fetching the
+// missing indices from peers) before handing the log to raft.
+//
+// Overrides (a later entry with the same index replacing an earlier
+// one from a stale term) are handled by keeping the latest entry for
+// each index. Uncommitted entries beyond state.Commit may still be
+// returned, matching ReadAll's semantics.
+func (w *WAL) ReadAllSparse() (metadata []byte, state raftpb.HardState, ents []raftpb.Entry, err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	rec := &walpb.Record{}
+	if w.decoder == nil {
+		return nil, state, nil, ErrDecoderNotFound
+	}
+	decoder := w.decoder
+
+	// Accumulate entries keyed by index. A later record for the same
+	// index overrides an earlier one (raft override semantics).
+	byIndex := make(map[uint64]raftpb.Entry)
+	var match bool
+	for err = decoder.Decode(rec); err == nil; err = decoder.Decode(rec) {
+		switch rec.GetType() {
+		case EntryType:
+			e := MustUnmarshalEntry(rec.Data)
+			if e.Index > w.start.GetIndex() {
+				byIndex[e.Index] = e
+				if e.Index > w.enti {
+					w.enti = e.Index
+				}
+			}
+		case StateType:
+			state = MustUnmarshalState(rec.Data)
+		case MetadataType:
+			if metadata != nil && !bytes.Equal(metadata, rec.Data) {
+				state.Reset()
+				return nil, state, nil, ErrMetadataConflict
+			}
+			metadata = rec.Data
+		case CrcType:
+			crc := decoder.LastCRC()
+			if crc != 0 && rec.Validate(crc) != nil {
+				state.Reset()
+				return nil, state, nil, ErrCRCMismatch
+			}
+			decoder.UpdateCRC(rec.GetCrc())
+		case SnapshotType:
+			var snap walpb.Snapshot
+			pbutil.MustUnmarshal(&snap, rec.Data)
+			if snap.GetIndex() == w.start.GetIndex() {
+				if snap.GetTerm() != w.start.GetTerm() {
+					state.Reset()
+					return nil, state, nil, ErrSnapshotMismatch
+				}
+				match = true
+			}
+		default:
+			state.Reset()
+			return nil, state, nil, fmt.Errorf("unexpected block type %d", rec.Type)
+		}
+	}
+
+	switch w.tail() {
+	case nil:
+		if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+			state.Reset()
+			return nil, state, nil, err
+		}
+	default:
+		if !errors.Is(err, io.EOF) {
+			state.Reset()
+			return nil, state, nil, err
+		}
+		if _, err = w.tail().Seek(w.decoder.LastOffset(), io.SeekStart); err != nil {
+			return nil, state, nil, err
+		}
+		if err = fileutil.ZeroToEnd(w.tail().File); err != nil {
+			return nil, state, nil, err
+		}
+	}
+
+	err = nil
+	if !match && w.start.GetIndex() != 0 {
+		err = ErrSnapshotNotFound
+	}
+
+	if w.readClose != nil {
+		w.readClose()
+		w.readClose = nil
+	}
+	w.start = walpb.Snapshot{}
+	w.metadata = metadata
+	if w.tail() != nil {
+		var encErr error
+		w.encoder, encErr = newFileEncoder(w.tail().File, w.decoder.LastCRC())
+		if encErr != nil {
+			return nil, state, nil, encErr
+		}
+	}
+	w.decoder = nil
+
+	// Flatten the map into an index-ordered slice.
+	indices := make([]uint64, 0, len(byIndex))
+	for idx := range byIndex {
+		indices = append(indices, idx)
+	}
+	sort.Slice(indices, func(i, j int) bool { return indices[i] < indices[j] })
+	ents = make([]raftpb.Entry, 0, len(indices))
+	for _, idx := range indices {
+		ents = append(ents, byIndex[idx])
+	}
+
+	return metadata, state, ents, err
 }
 
 // ReadAll reads out records of the current WAL.

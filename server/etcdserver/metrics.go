@@ -160,6 +160,19 @@ var (
 		Name:      "limit",
 		Help:      "The file descriptor limit.",
 	})
+
+	metronomeWorkStealsTriggered = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "etcd",
+		Subsystem: "metronome",
+		Name:      "work_steals_triggered_total",
+		Help:      "Number of times this metronome node triggered a work-steal due to a commit-index stall while holding skipped entries.",
+	})
+	metronomeWorkStealEntries = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "etcd",
+		Subsystem: "metronome",
+		Name:      "work_steal_entries_written_total",
+		Help:      "Total number of raft log entries this node fsynced as a result of work-stealing (over and above its persist-set assignments).",
+	})
 )
 
 func init() {
@@ -182,6 +195,8 @@ func init() {
 	prometheus.MustRegister(learnerPromoteFailed)
 	prometheus.MustRegister(fdUsed)
 	prometheus.MustRegister(fdLimit)
+	prometheus.MustRegister(metronomeWorkStealsTriggered)
+	prometheus.MustRegister(metronomeWorkStealEntries)
 
 	currentVersion.With(prometheus.Labels{
 		"server_version": version.Version,

@@ -176,6 +176,33 @@ type ServerConfig struct {
 	// Setting this is unsafe and will cause data loss.
 	UnsafeNoFsync bool `json:"unsafe-no-fsync"`
 
+	// ExperimentalInMemOnly disables all WAL and snapshot disk I/O.
+	// The raft log and snapshots are kept entirely in memory.
+	// The node is ephemeral: all state is lost on restart.
+	ExperimentalInMemOnly bool `json:"experimental-in-mem-only"`
+
+	// Metronome enables a rotating persist-set for raft log entries and
+	// snapshots. Only a quorum-sized subset of nodes WAL-persists each
+	// entry; the rest keep it only in memory. HardState (term/vote/commit)
+	// is always persisted on every node. Mutually exclusive with
+	// ExperimentalInMemOnly.
+	Metronome bool `json:"metronome"`
+	// MetronomeQuorumSize is the size K of the persist-set per entry.
+	// Valid range is [f+1, N]. 0 means default (f+1).
+	MetronomeQuorumSize uint `json:"metronome-quorum-size"`
+	// MetronomeWorkStealTimeout is how long a metronome follower
+	// waits for the cluster's committed index to advance while
+	// having entries it chose not to persist. When the timeout
+	// elapses without progress, the follower steals logging work
+	// from stragglers by fsyncing those buffered entries itself.
+	// Zero selects the default (50ms).
+	MetronomeWorkStealTimeout time.Duration `json:"metronome-work-steal-timeout"`
+	// MetronomeWorkStealDuration is how long the follower stays
+	// in "log everything" mode after triggering a work-steal, to
+	// avoid repeated timeout overhead while the straggler is slow.
+	// Zero selects the default (1m, matching the paper).
+	MetronomeWorkStealDuration time.Duration `json:"metronome-work-steal-duration"`
+
 	DowngradeCheckTime time.Duration
 
 	// MemoryMlock enables mlocking of etcd owned memory pages.

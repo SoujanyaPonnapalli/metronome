@@ -39,6 +39,7 @@ import (
 	"go.etcd.io/etcd/server/v3/etcdserver/api/snap"
 	"go.etcd.io/etcd/server/v3/etcdserver/api/v3discovery"
 	"go.etcd.io/etcd/server/v3/etcdserver/cindex"
+	"go.etcd.io/etcd/server/v3/etcdserver/metronome"
 	servererrors "go.etcd.io/etcd/server/v3/etcdserver/errors"
 	serverstorage "go.etcd.io/etcd/server/v3/storage"
 	"go.etcd.io/etcd/server/v3/storage/backend"
@@ -50,6 +51,10 @@ import (
 )
 
 func bootstrap(cfg config.ServerConfig) (b *bootstrappedServer, err error) {
+	if cfg.ExperimentalInMemOnly {
+		return bootstrapInMem(cfg)
+	}
+
 	if cfg.MaxRequestBytes > recommendedMaxRequestBytes {
 		cfg.Logger.Warn(
 			"exceeded recommended request limit",
@@ -152,7 +157,7 @@ type bootstrappedServer struct {
 	cluster *bootstrappedCluster
 	raft    *bootstrappedRaft
 	prt     http.RoundTripper
-	ss      *snap.Snapshotter
+	ss      snap.Snapshotter
 }
 
 func (s *bootstrappedServer) Close() {
@@ -206,7 +211,7 @@ func bootstrapStorage(cfg config.ServerConfig, be *bootstrappedBackend, wal *boo
 	}
 }
 
-func bootstrapSnapshot(cfg config.ServerConfig) *snap.Snapshotter {
+func bootstrapSnapshot(cfg config.ServerConfig) snap.Snapshotter {
 	if err := fileutil.TouchDirAll(cfg.Logger, cfg.SnapDir()); err != nil {
 		cfg.Logger.Fatal(
 			"failed to create snapshot directory",
@@ -225,6 +230,68 @@ func bootstrapSnapshot(cfg config.ServerConfig) *snap.Snapshotter {
 		)
 	}
 	return snap.New(cfg.Logger, cfg.SnapDir())
+}
+
+// bootstrapInMem creates a server that keeps all raft log and snapshot state
+// in memory only. No WAL files or snapshot files are created. The node is
+// ephemeral: all raft state is lost on restart.
+func bootstrapInMem(cfg config.ServerConfig) (*bootstrappedServer, error) {
+	// Backend still uses disk (BoltDB) — only WAL and raft snapshots are in-mem.
+	// Ensure data and member directories exist for the backend.
+	if terr := fileutil.TouchDirAll(cfg.Logger, cfg.DataDir); terr != nil {
+		return nil, fmt.Errorf("cannot access data directory: %w", terr)
+	}
+	if terr := fileutil.TouchDirAll(cfg.Logger, cfg.MemberDir()); terr != nil {
+		return nil, fmt.Errorf("cannot access member directory: %w", terr)
+	}
+	if terr := fileutil.TouchDirAll(cfg.Logger, cfg.SnapDir()); terr != nil {
+		return nil, fmt.Errorf("cannot access snap directory: %w", terr)
+	}
+
+	prt, err := rafthttp.NewRoundTripper(cfg.PeerTLSInfo, cfg.PeerDialTimeout())
+	if err != nil {
+		return nil, err
+	}
+
+	ss := snap.NewInMem(cfg.Logger)
+
+	// Backend still uses disk (BoltDB). Only WAL and snapshots are in-mem.
+	be, err := bootstrapBackend(cfg, false /* haveWAL */)
+	if err != nil {
+		return nil, err
+	}
+
+	cluster, err := bootstrapNewClusterNoWAL(cfg, prt)
+	if err != nil {
+		be.Close()
+		return nil, err
+	}
+
+	// Empty bootstrappedWAL — no entries, no hard state, no snapshot.
+	// MemoryStorage starts fresh.
+	bwal := &bootstrappedWAL{
+		lg: cfg.Logger,
+	}
+
+	s := &bootstrappedStorage{
+		backend: be,
+		wal:     bwal,
+	}
+
+	if err = cluster.Finalize(cfg, s); err != nil {
+		be.Close()
+		return nil, err
+	}
+
+	raftNode := bootstrapRaftFromCluster(cfg, cluster.cl, cluster.cl.MemberIDs(), bwal)
+
+	return &bootstrappedServer{
+		prt:     prt,
+		ss:      ss,
+		storage: s,
+		cluster: cluster,
+		raft:    raftNode,
+	}, nil
 }
 
 func bootstrapBackend(cfg config.ServerConfig, haveWAL bool) (backend *bootstrappedBackend, err error) {
@@ -550,7 +617,7 @@ func raftConfig(cfg config.ServerConfig, id uint64, s *raft.MemoryStorage) *raft
 	}
 }
 
-func (b *bootstrappedRaft) newRaftNode(ss *snap.Snapshotter, wal *wal.WAL, cl *membership.RaftCluster) *raftNode {
+func (b *bootstrappedRaft) newRaftNode(cfg config.ServerConfig, ss snap.Snapshotter, wal *wal.WAL, cl *membership.RaftCluster) *raftNode {
 	var n raft.Node
 	if len(b.peers) == 0 {
 		n = raft.RestartNode(b.config)
@@ -560,16 +627,81 @@ func (b *bootstrappedRaft) newRaftNode(ss *snap.Snapshotter, wal *wal.WAL, cl *m
 	raftStatusMu.Lock()
 	raftStatus = n.Status
 	raftStatusMu.Unlock()
+
+	// Build the metronome scheme if enabled. Disabled for N=1 (single-node
+	// clusters don't benefit and the round-robin collapses to "always persist").
+	var scheme *metronome.Scheme
+	localID := b.config.ID
+	if cfg.Metronome && cl != nil && len(cl.VotingMemberIDs()) > 1 {
+		// Metronome's safety invariant (K ≥ f+1) is defined over
+		// voting members only: learners don't count toward raft's
+		// commit quorum and aren't eligible to carry durable copies
+		// for recovery. Excluding them here keeps the persist-set
+		// exclusively on voters.
+		members := cl.VotingMemberIDs()
+		ids := make([]uint64, 0, len(members))
+		for _, m := range members {
+			ids = append(ids, uint64(m))
+		}
+		k := int(cfg.MetronomeQuorumSize) // 0 → default (f+1) inside NewScheme
+		s, err := metronome.NewScheme(ids, k)
+		if err != nil {
+			b.lg.Fatal("failed to construct metronome scheme", zap.Error(err))
+		}
+		scheme = s
+		b.lg.Info("metronome enabled",
+			zap.Int("cluster-size", s.NumNodes()),
+			zap.Int("quorum-size", s.QuorumSize()),
+			zap.Uint64("local-id", localID),
+		)
+	}
+
+	// Work-stealing tunables.
+	//
+	// Default timeout: 1s (or 10× TickMs, whichever is larger). This
+	// must be safely above typical commit-latency p99 jitter under
+	// healthy operation — otherwise a brief GC pause or network
+	// hiccup triggers WS and puts the follower in "log everything"
+	// mode for the full duration, wiping out metronome's byte
+	// savings. Real stragglers (disconnected peers, stalled disks)
+	// take seconds to become a problem; we target those.
+	//
+	// Default duration: 1 minute, matching the paper (Metronome §4.2).
+	wsTimeout := cfg.MetronomeWorkStealTimeout
+	if wsTimeout <= 0 {
+		wsTimeout = 10 * time.Duration(cfg.TickMs) * time.Millisecond
+		if wsTimeout < time.Second {
+			wsTimeout = time.Second
+		}
+	}
+	wsDuration := cfg.MetronomeWorkStealDuration
+	if wsDuration <= 0 {
+		wsDuration = time.Minute
+	}
+
 	return newRaftNode(
 		raftNodeConfig{
-			lg:          b.lg,
-			isIDRemoved: func(id uint64) bool { return cl.IsIDRemoved(types.ID(id)) },
-			Node:        n,
-			heartbeat:   b.heartbeat,
-			raftStorage: b.storage,
-			storage:     serverstorage.NewStorage(b.lg, wal, ss),
+			lg:              b.lg,
+			isIDRemoved:     func(id uint64) bool { return cl.IsIDRemoved(types.ID(id)) },
+			Node:            n,
+			heartbeat:       b.heartbeat,
+			raftStorage:     b.storage,
+			storage:         buildRaftStorage(b.lg, wal, ss),
+			localID:         localID,
+			metronomeScheme: scheme,
+			wsTimeout:       wsTimeout,
+			wsDuration:      wsDuration,
 		},
 	)
+}
+
+// buildRaftStorage returns an InMemStorage when wal is nil (ExperimentalInMemOnly
+// mode), otherwise wraps the WAL and snapshotter in the disk-backed storage.
+func buildRaftStorage(lg *zap.Logger, w *wal.WAL, ss snap.Snapshotter) serverstorage.Storage {
+	if w == nil {
+		return serverstorage.NewInMemStorage()
+	}
+	return serverstorage.NewStorage(lg, w, ss)
 }
 
 func bootstrapWALFromSnapshot(cfg config.ServerConfig, snapshot *raftpb.Snapshot, ci cindex.ConsistentIndexer) *bootstrappedWAL {
@@ -638,7 +770,53 @@ func openWALFromSnapshot(cfg config.ServerConfig, snapshot *raftpb.Snapshot) (*w
 		if cfg.UnsafeNoFsync {
 			w.SetUnsafeNoFsync()
 		}
-		wmetadata, st, ents, err := w.ReadAll()
+		var (
+			wmetadata []byte
+			st        raftpb.HardState
+			ents      []raftpb.Entry
+		)
+		if cfg.Metronome {
+			// Metronome nodes have a sparse WAL: only entries where
+			// this node was in the rotating persist-set were fsynced.
+			// We never replay this sparse log on restart — that would
+			// require gap-fetching from peers, which adds complexity.
+			// Instead we rely on:
+			//   (a) the on-disk snapshot + HardState giving raft a
+			//       consistent starting state, and
+			//   (b) standard raft AppendEntries / MsgSnap catchup to
+			//       fill the gap from a live peer's in-memory raft log.
+			// ReadAllSparse is used only to tolerate the gaps while
+			// decoding the WAL file; we immediately discard `ents`.
+			wmetadata, st, _, err = w.ReadAllSparse()
+			ents = nil
+
+			// With no entries loaded, raft's MemoryStorage exposes
+			// `lastIndex = snapshot.Index`. raft.loadState asserts
+			// `HardState.Commit ≤ lastIndex`, so we must clamp any
+			// Commit that races ahead of the on-disk snapshot —
+			// which happens when force-snapshot-on-shutdown lagged
+			// behind apply, or when the node crashed.
+			//
+			// Safety of clamping: every index in
+			//   (snapshot.Index, oldCommit]
+			// is durable on a quorum (K ≥ f+1) of metronome peers,
+			// so the leader will re-advance our Commit via MsgApp /
+			// MsgSnap after we start. Preserving HardState.Term and
+			// HardState.Vote keeps election safety intact. The
+			// backend's consistent_index is independent of this and
+			// prevents double-apply of entries we already applied
+			// before shutdown.
+			if snapshot != nil && st.Commit > snapshot.Metadata.Index {
+				cfg.Logger.Info(
+					"metronome: clamping HardState.Commit to snapshot index",
+					zap.Uint64("old-commit", st.Commit),
+					zap.Uint64("snapshot-index", snapshot.Metadata.Index),
+				)
+				st.Commit = snapshot.Metadata.Index
+			}
+		} else {
+			wmetadata, st, ents, err = w.ReadAll()
+		}
 		if err != nil {
 			w.Close()
 			// we can only repair ErrUnexpectedEOF and we never repair twice.
