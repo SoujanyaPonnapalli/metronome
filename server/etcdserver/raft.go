@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -86,6 +87,12 @@ type raftNode struct {
 	latestTickTs time.Time
 	raftNodeConfig
 
+	// metronomeSchemeLive holds the currently active metronome scheme.
+	// It is read (without a lock) on the Ready hot path and is swapped
+	// when membership changes (via UpdateMetronomeScheme, called from
+	// the apply loop after a ConfChange is committed).
+	metronomeSchemeLive atomic.Pointer[metronome.Scheme]
+
 	// a chan to send/receive snapshot
 	msgSnapC chan raftpb.Message
 
@@ -126,7 +133,33 @@ type raftNodeConfig struct {
 	// metronomeScheme, if non-nil, filters which entries and snapshots
 	// this node WAL-persists. HardState is always persisted regardless
 	// of the scheme. The leader always persists everything.
+	//
+	// The pointer is stored atomically (via metronomeSchemeLive on the
+	// parent raftNode) so that it can be swapped on membership changes
+	// without a lock on the Ready hot path. This config field holds
+	// the initial value set at bootstrap; runtime lookups go through
+	// raftNode.currentScheme().
 	metronomeScheme *metronome.Scheme
+
+	// Work-stealing (Metronome §4.2). A follower tracks entries it
+	// chose not to persist, alongside a timer reset on every
+	// commit-index advance. If the commit stalls long enough while
+	// skipped entries exist, we "steal" logging work from stragglers
+	// by fsyncing the buffered entries ourselves and temporarily
+	// logging every entry (not just our persist-set slot). This
+	// keeps progress going when a peer in the K-of-N persist-set is
+	// slow, at the cost of a small amount of extra logging on this
+	// node.
+	//
+	// All fields below are guarded by wsMu and read/written only on
+	// the raft Ready loop, so contention is minimal.
+	wsMu          sync.Mutex
+	wsSkipped     []uint64  // indices we did not persist (FIFO; kept sorted)
+	wsLastCommit  uint64    // last seen committed index (for advance detection)
+	wsLastAdvance time.Time // wall time of last commit-index advance
+	wsActiveUntil time.Time // non-zero until this time => persist everything
+	wsTimeout     time.Duration
+	wsDuration    time.Duration
 }
 
 func newRaftNode(cfg raftNodeConfig) *raftNode {
@@ -161,7 +194,32 @@ func newRaftNode(cfg raftNodeConfig) *raftNode {
 	} else {
 		r.ticker = time.NewTicker(r.heartbeat)
 	}
+	if cfg.metronomeScheme != nil {
+		r.metronomeSchemeLive.Store(cfg.metronomeScheme)
+	}
 	return r
+}
+
+// currentScheme returns the active metronome scheme, or nil if
+// metronome mode is disabled. Safe to call concurrently; the pointer
+// is swapped atomically on membership changes.
+func (r *raftNode) currentScheme() *metronome.Scheme {
+	return r.metronomeSchemeLive.Load()
+}
+
+// UpdateMetronomeScheme replaces the active scheme. Called from the
+// apply loop after a ConfChange commits, so the scheme reflects the
+// new membership. Passing nil is a no-op (keeps the existing scheme);
+// the scheme cannot be disabled at runtime.
+func (r *raftNode) UpdateMetronomeScheme(s *metronome.Scheme) {
+	if s == nil {
+		return
+	}
+	r.metronomeSchemeLive.Store(s)
+	r.lg.Info("metronome scheme updated",
+		zap.Int("cluster-size", s.NumNodes()),
+		zap.Int("quorum-size", s.QuorumSize()),
+	)
 }
 
 // raft.Node does not have locks in Raft package
@@ -269,6 +327,7 @@ func (r *raftNode) start(rh *raftReadyHandler) {
 				entsToSave := rd.Entries
 				if r.metronomeScheme != nil && !islead {
 					entsToSave = r.filterMetronomeEntries(rd.Entries)
+					r.recordReadySkipped(rd.HardState.Commit, rd.Entries, entsToSave)
 				}
 				// gofail: var raftBeforeSave struct{}
 				if err := r.storage.Save(rd.HardState, entsToSave); err != nil {
@@ -352,6 +411,13 @@ func (r *raftNode) start(rh *raftReadyHandler) {
 					// notify etcdserver that raft has already been notified or advanced.
 					raftAdvancedC <- struct{}{}
 				}
+
+				// Metronome §4.2: cheap stall-check after each Ready.
+				// No-op unless metronome is enabled AND a follower saw
+				// committed-index stall while sitting on skipped entries.
+				if r.metronomeScheme != nil && !islead {
+					r.maybeTriggerWorkSteal()
+				}
 			case <-r.stopped:
 				return
 			}
@@ -426,28 +492,248 @@ func (r *raftNode) shouldPersistSnapshot(islead bool, snapshotIndex uint64) bool
 	if r.metronomeScheme == nil || islead {
 		return true
 	}
-	return r.metronomeScheme.ShouldPersist(r.localID, snapshotIndex)
+	scheme := r.currentScheme()
+	if scheme == nil {
+		return true
+	}
+	return scheme.ShouldPersist(r.localID, snapshotIndex)
 }
 
 // filterMetronomeEntries returns the subset of entries that this
 // follower should WAL-persist under the active metronome scheme.
 // Configuration-change entries (EntryConfChange, EntryConfChangeV2) are
 // always kept: membership transitions must be durable on every node so
-// the scheme can be reconstructed post-restart.
+// the scheme can be reconstructed post-restart. When the node is in
+// work-stealing mode (after recent straggler-driven timeout), ALL
+// entries are kept regardless of the scheme — strictly stronger than
+// the scheme's K-of-N guarantee, so safety is preserved.
 func (r *raftNode) filterMetronomeEntries(ents []raftpb.Entry) []raftpb.Entry {
 	if len(ents) == 0 {
 		return ents
+	}
+	if r.inWorkStealMode() {
+		return ents
+	}
+	scheme := r.currentScheme()
+	if scheme == nil {
+		return ents // scheme not set yet; fall back to persist-all
 	}
 	out := ents[:0:0] // don't mutate caller's slice
 	for i := range ents {
 		e := &ents[i]
 		keep := e.Type == raftpb.EntryConfChange || e.Type == raftpb.EntryConfChangeV2 ||
-			r.metronomeScheme.ShouldPersist(r.localID, e.Index)
+			scheme.ShouldPersist(r.localID, e.Index)
 		if keep {
 			out = append(out, *e)
 		}
 	}
 	return out
+}
+
+// ---- Work stealing (Metronome §4.2) ---------------------------------
+
+// inWorkStealMode returns true if this node is currently in the
+// "log everything" window triggered by a recent straggler timeout.
+func (r *raftNode) inWorkStealMode() bool {
+	if r.metronomeScheme == nil {
+		return false
+	}
+	r.wsMu.Lock()
+	defer r.wsMu.Unlock()
+	return !r.wsActiveUntil.IsZero() && time.Now().Before(r.wsActiveUntil)
+}
+
+// recordReadySkipped bookkeeps which entry indices from `allEnts` were
+// filtered out of `kept` (i.e., NOT fsynced this Ready), and updates
+// the commit-advance timestamp when HardState.Commit moves forward.
+// Safe to call unconditionally; no-op when metronome is disabled.
+func (r *raftNode) recordReadySkipped(hsCommit uint64, allEnts, kept []raftpb.Entry) {
+	if r.metronomeScheme == nil {
+		return
+	}
+	r.wsMu.Lock()
+	defer r.wsMu.Unlock()
+
+	// 1. Reset the stall timer on commit advance. Also drop skipped
+	//    indices that are now committed — those entries have been
+	//    committed despite us not logging them, so no straggler is
+	//    hurting us on them.
+	if hsCommit > r.wsLastCommit {
+		r.wsLastCommit = hsCommit
+		r.wsLastAdvance = time.Now()
+		if len(r.wsSkipped) > 0 {
+			i := 0
+			for i < len(r.wsSkipped) && r.wsSkipped[i] <= hsCommit {
+				i++
+			}
+			r.wsSkipped = r.wsSkipped[i:]
+		}
+	}
+
+	// 2. In work-stealing mode, everything was persisted — no bookkeeping.
+	if !r.wsActiveUntil.IsZero() && time.Now().Before(r.wsActiveUntil) {
+		return
+	}
+
+	// 3. Record skipped indices (appended sorted by index; allEnts is
+	//    already index-sorted, and kept is a filtered subsequence).
+	if len(allEnts) == len(kept) {
+		return // nothing filtered out
+	}
+	wasEmpty := len(r.wsSkipped) == 0
+	keptByIdx := make(map[uint64]struct{}, len(kept))
+	for i := range kept {
+		keptByIdx[kept[i].Index] = struct{}{}
+	}
+	for i := range allEnts {
+		e := &allEnts[i]
+		if _, ok := keptByIdx[e.Index]; ok {
+			continue
+		}
+		if e.Index <= r.wsLastCommit {
+			continue // already committed; ignore
+		}
+		r.wsSkipped = append(r.wsSkipped, e.Index)
+	}
+	// 4. Arm the stall timer the moment the buffer transitions 0→N
+	//    (paper §4.2: "the timer is started when an entry is added
+	//    to the buffer"). Without this, the timer sometimes runs
+	//    stale from an earlier Ready and fires spuriously at startup.
+	if wasEmpty && len(r.wsSkipped) > 0 {
+		r.wsLastAdvance = time.Now()
+	}
+}
+
+// maybeTriggerWorkSteal checks the stall condition and, if met,
+// flushes the buffered skipped entries to WAL and enters the
+// "log everything" window for wsDuration. Called from the Ready
+// loop after each iteration — cheap in the common case (O(1) time
+// check; no syscalls unless we actually steal).
+func (r *raftNode) maybeTriggerWorkSteal() {
+	if r.metronomeScheme == nil {
+		return
+	}
+	r.wsMu.Lock()
+	// Already stealing? Exit once the window is up.
+	if !r.wsActiveUntil.IsZero() {
+		if time.Now().Before(r.wsActiveUntil) {
+			r.wsMu.Unlock()
+			return
+		}
+		// Window elapsed — return to normal filtering.
+		r.wsActiveUntil = time.Time{}
+	}
+	// No skipped entries → nothing to steal.
+	if len(r.wsSkipped) == 0 {
+		r.wsMu.Unlock()
+		return
+	}
+	// Don't fire until we've seen at least one real commit advance.
+	// Otherwise the pre-election / initial-replication startup window
+	// counts against the timeout, and every follower would immediately
+	// enter "log everything" mode the first time we restart, defeating
+	// metronome's whole point.
+	if r.wsLastCommit == 0 {
+		r.wsMu.Unlock()
+		return
+	}
+	// Has the commit stalled long enough?
+	if time.Since(r.wsLastAdvance) < r.wsTimeout {
+		r.wsMu.Unlock()
+		return
+	}
+
+	// Prepare the steal: collect the indices to flush and arm the
+	// work-stealing window before releasing the lock, so other
+	// Readies see us as "in mode" and won't add more to wsSkipped.
+	toFlush := make([]uint64, len(r.wsSkipped))
+	copy(toFlush, r.wsSkipped)
+	r.wsSkipped = r.wsSkipped[:0]
+	jitter := time.Duration(int64(r.wsDuration) / 8) // ±12.5% jitter
+	r.wsActiveUntil = time.Now().Add(r.wsDuration + jitterDuration(jitter))
+	r.wsMu.Unlock()
+
+	// Pull the entries from the in-memory raft log and fsync them.
+	ents := r.collectInMemoryEntries(toFlush)
+	if len(ents) > 0 {
+		if err := r.storage.Save(raftpb.HardState{}, ents); err != nil {
+			r.lg.Warn("metronome work-steal: Save failed", zap.Error(err))
+		}
+	}
+	metronomeWorkStealsTriggered.Inc()
+	metronomeWorkStealEntries.Add(float64(len(ents)))
+	r.lg.Info("metronome work-steal fired",
+		zap.Int("skipped-buffered", len(toFlush)),
+		zap.Int("entries-flushed", len(ents)),
+		zap.Duration("window", r.wsDuration),
+	)
+}
+
+// collectInMemoryEntries returns the raft entries for the given
+// indices by reading from raftStorage (in-memory). Indices that are
+// below the compaction floor or above the last index are silently
+// skipped; the caller treats this as "nothing to do."
+func (r *raftNode) collectInMemoryEntries(indices []uint64) []raftpb.Entry {
+	if len(indices) == 0 {
+		return nil
+	}
+	first, err := r.raftStorage.FirstIndex()
+	if err != nil {
+		return nil
+	}
+	last, err := r.raftStorage.LastIndex()
+	if err != nil || last == 0 {
+		return nil
+	}
+	// Group into contiguous runs to minimize Entries() calls.
+	out := make([]raftpb.Entry, 0, len(indices))
+	i := 0
+	for i < len(indices) {
+		j := i + 1
+		for j < len(indices) && indices[j] == indices[j-1]+1 {
+			j++
+		}
+		lo := indices[i]
+		hi := indices[j-1] + 1
+		if lo < first {
+			lo = first
+		}
+		if hi > last+1 {
+			hi = last + 1
+		}
+		if lo < hi {
+			ents, e := r.raftStorage.Entries(lo, hi, ^uint64(0))
+			if e == nil {
+				wanted := make(map[uint64]struct{}, j-i)
+				for k := i; k < j; k++ {
+					wanted[indices[k]] = struct{}{}
+				}
+				for k := range ents {
+					if _, ok := wanted[ents[k].Index]; ok {
+						out = append(out, ents[k])
+					}
+				}
+			}
+		}
+		i = j
+	}
+	return out
+}
+
+// jitterDuration returns a deterministic-enough pseudo-random offset
+// in [-max, max]. We use time.Now() as the source so two concurrent
+// recoverers don't trigger work-stealing synchronously.
+func jitterDuration(max time.Duration) time.Duration {
+	if max <= 0 {
+		return 0
+	}
+	// Tiny xorshift on nanosecond of now; acceptable for jitter.
+	n := uint64(time.Now().UnixNano())
+	n ^= n >> 16
+	n *= 0x9E3779B97F4A7C15
+	n ^= n >> 33
+	// Map to [-max, max].
+	return time.Duration(int64(n&0xFFFF)%int64(2*max)) - max
 }
 
 func (r *raftNode) apply() chan toApply {

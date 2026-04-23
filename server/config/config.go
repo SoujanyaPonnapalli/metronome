@@ -190,6 +190,18 @@ type ServerConfig struct {
 	// MetronomeQuorumSize is the size K of the persist-set per entry.
 	// Valid range is [f+1, N]. 0 means default (f+1).
 	MetronomeQuorumSize uint `json:"metronome-quorum-size"`
+	// MetronomeWorkStealTimeout is how long a metronome follower
+	// waits for the cluster's committed index to advance while
+	// having entries it chose not to persist. When the timeout
+	// elapses without progress, the follower steals logging work
+	// from stragglers by fsyncing those buffered entries itself.
+	// Zero selects the default (50ms).
+	MetronomeWorkStealTimeout time.Duration `json:"metronome-work-steal-timeout"`
+	// MetronomeWorkStealDuration is how long the follower stays
+	// in "log everything" mode after triggering a work-steal, to
+	// avoid repeated timeout overhead while the straggler is slow.
+	// Zero selects the default (1m, matching the paper).
+	MetronomeWorkStealDuration time.Duration `json:"metronome-work-steal-duration"`
 
 	DowngradeCheckTime time.Duration
 

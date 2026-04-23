@@ -225,6 +225,8 @@ func StartEtcd(inCfg *Config) (e *Etcd, err error) {
 		ExperimentalInMemOnly:             cfg.ExperimentalInMemOnly,
 		Metronome:                         cfg.Metronome,
 		MetronomeQuorumSize:               cfg.MetronomeQuorumSize,
+		MetronomeWorkStealTimeout:         cfg.MetronomeWorkStealTimeout,
+		MetronomeWorkStealDuration:        cfg.MetronomeWorkStealDuration,
 		CompactionBatchLimit:              cfg.CompactionBatchLimit,
 		CompactionSleepInterval:           cfg.CompactionSleepInterval,
 		WatchProgressNotifyInterval:       cfg.WatchProgressNotifyInterval,

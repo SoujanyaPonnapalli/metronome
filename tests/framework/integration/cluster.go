@@ -175,6 +175,11 @@ type ClusterConfig struct {
 	DisableStrictReconfigCheck  bool
 	CorruptCheckTime            time.Duration
 	Metrics                     string
+
+	// Metronome enables metronome mode (rotating persist-set). Each node
+	// fsyncs only the entries where index%N ∈ persist-set; recovery
+	// discards sparse WAL entries and relies on snapshot + raft catchup.
+	Metronome bool
 }
 
 type Cluster struct {
@@ -288,6 +293,7 @@ func (c *Cluster) MustNewMember(t testutil.TB) *Member {
 			DisableStrictReconfigCheck:  c.Cfg.DisableStrictReconfigCheck,
 			CorruptCheckTime:            c.Cfg.CorruptCheckTime,
 			Metrics:                     c.Cfg.Metrics,
+			Metronome:                   c.Cfg.Metronome,
 		})
 	return m
 }
@@ -613,6 +619,7 @@ type MemberConfig struct {
 	DisableStrictReconfigCheck  bool
 	CorruptCheckTime            time.Duration
 	Metrics                     string
+	Metronome                   bool
 }
 
 // MustNewMember return an inited member with the given name. If peerTLS is
@@ -726,6 +733,7 @@ func MustNewMember(t testutil.TB, mcfg MemberConfig) *Member {
 		m.MaxLearners = mcfg.MaxLearners
 	}
 	m.Metrics = mcfg.Metrics
+	m.Metronome = mcfg.Metronome
 	m.V2Deprecation = config.V2_DEPR_DEFAULT //nolint:staticcheck // TODO: remove for a supported version
 	m.GRPCServerRecorder = &grpctesting.GRPCRecorder{}
 
